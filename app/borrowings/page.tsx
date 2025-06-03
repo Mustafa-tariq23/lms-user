@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { useAuth } from "@/contexts/auth-context"
 import { ProtectedRoute } from "@/components/protected-route"
 import { Navbar } from "@/components/navbar"
@@ -11,8 +11,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useToast } from "@/hooks/use-toast"
 import { collection, query, where, getDocs, addDoc } from "firebase/firestore"
 import { db } from "@/lib/firebase"
-import { format, isAfter } from "date-fns"
-import { Clock, CheckCircle, XCircle, RotateCcw, AlertTriangle, BookOpen } from "lucide-react"
+import { format, isAfter, differenceInDays } from "date-fns"
+import { Clock, CheckCircle, XCircle, RotateCcw, AlertTriangle, BookOpen } from 'lucide-react'
+import { logger, withErrorLogging } from "@/lib/logger"
 
 interface Borrowing {
   id: string
@@ -30,16 +31,28 @@ export default function BorrowingsPage() {
   const [borrowings, setBorrowings] = useState<Borrowing[]>([])
   const [loading, setLoading] = useState(true)
   const [submittingReturn, setSubmittingReturn] = useState<string | null>(null)
+  const [currentTab, setCurrentTab] = useState("pending")
   const { toast } = useToast()
+  
+  // For tracking tab switches
+  const tabStartTime = useRef<number>(Date.now())
+  const previousTab = useRef<string>("pending")
+
+  const logError = withErrorLogging("BorrowingsPage")
 
   useEffect(() => {
     if (user) {
       fetchBorrowings()
+      // Log page view
+      logger.logPageView("My Borrowings", "/borrowings", user.uid, document.referrer)
+      logger.logViewHistory("borrowings", user.uid)
     }
   }, [user])
 
   const fetchBorrowings = async () => {
     if (!user) return
+
+    const startTime = Date.now()
 
     try {
       // Simple query without orderBy to avoid composite index requirement
@@ -59,8 +72,16 @@ export default function BorrowingsPage() {
       })
 
       setBorrowings(borrowingsData)
-    } catch (error) {
+
+      // Log successful API request
+      await logger.logApiRequest("/api/borrowings", "GET", Date.now() - startTime, 200, user.uid)
+    } catch (error: any) {
       console.error("Error fetching borrowings:", error)
+      logError(error, user.uid)
+
+      // Log failed API request
+      await logger.logApiRequest("/api/borrowings", "GET", Date.now() - startTime, 500, user.uid)
+
       toast({
         title: "Error",
         description: "Failed to fetch borrowing history",
@@ -71,11 +92,46 @@ export default function BorrowingsPage() {
     }
   }
 
+  const handleTabChange = (newTab: string) => {
+    if (user && previousTab.current !== newTab) {
+      const timeSpent = Date.now() - tabStartTime.current
+      
+      // Log tab switch
+      logger.logTabSwitch("borrowings", previousTab.current, newTab, user.uid, timeSpent)
+      
+      // Log user interaction
+      logger.logUserInteraction("click", "tab", "borrowings", user.uid, `tab-${newTab}`, {
+        fromTab: previousTab.current,
+        toTab: newTab,
+        timeSpent
+      })
+      
+      previousTab.current = newTab
+      tabStartTime.current = Date.now()
+    }
+    setCurrentTab(newTab)
+  }
+
   const handleReturnRequest = async (borrowing: Borrowing) => {
     if (!user || !userData) return
 
+    // Log return button click
+    if (user) {
+      logger.logUserInteraction("click", "return_button", "borrowings", user.uid, `return-btn-${borrowing.id}`, {
+        bookId: borrowing.bookId,
+        bookTitle: borrowing.bookTitle,
+        borrowingId: borrowing.id
+      })
+    }
+
     setSubmittingReturn(borrowing.id)
+    const startTime = Date.now()
+
     try {
+      // Calculate if overdue
+      const isOverdue = borrowing.dueDate && isAfter(new Date(), borrowing.dueDate.toDate())
+      const daysPastDue = isOverdue ? differenceInDays(new Date(), borrowing.dueDate.toDate()) : undefined
+
       await addDoc(collection(db, "borrowings"), {
         userId: user.uid,
         userName: userData.name,
@@ -84,6 +140,23 @@ export default function BorrowingsPage() {
         requestDate: new Date(),
         type: "return",
         status: "pending",
+        originalBorrowingId: borrowing.id,
+      })
+
+      // Log return request
+      await logger.logReturnRequest(
+        borrowing.bookId,
+        borrowing.bookTitle,
+        borrowing.id,
+        !!isOverdue,
+        user.uid,
+        "submitted",
+        daysPastDue,
+      )
+
+      // Log API request timing
+      await logger.logApiRequest("/api/returns", "POST", Date.now() - startTime, 201, user.uid, {
+        bookId: borrowing.bookId,
         originalBorrowingId: borrowing.id,
       })
 
@@ -96,6 +169,24 @@ export default function BorrowingsPage() {
       fetchBorrowings()
     } catch (error: any) {
       console.error("Error submitting return request:", error)
+      logError(error, user.uid)
+
+      // Log failed return request
+      await logger.logReturnRequest(
+        borrowing.bookId,
+        borrowing.bookTitle,
+        borrowing.id,
+        false,
+        user.uid,
+        "failed"
+      )
+
+      // Log failed API request
+      await logger.logApiRequest("/api/returns", "POST", Date.now() - startTime, 500, user.uid, {
+        bookId: borrowing.bookId,
+        originalBorrowingId: borrowing.id,
+      })
+
       toast({
         title: "Error",
         description: error.message || "Failed to submit return request",
@@ -222,60 +313,74 @@ export default function BorrowingsPage() {
   const BorrowingCard = ({
     borrowing,
     showReturnButton = false,
-  }: { borrowing: Borrowing; showReturnButton?: boolean }) => (
-    <Card className="mb-4">
-      <CardContent className="p-6">
-        <div className="flex items-start justify-between">
-          <div className="flex-1">
-            <div className="flex items-center space-x-3 mb-2">
-              {getStatusIcon(borrowing.status)}
-              <h3 className="font-semibold text-lg">{borrowing.bookTitle}</h3>
+  }: { borrowing: Borrowing; showReturnButton?: boolean }) => {
+    
+    const handleCardClick = () => {
+      if (user) {
+        logger.logUserInteraction("click", "borrowing_card", "borrowings", user.uid, `borrowing-card-${borrowing.id}`, {
+          bookId: borrowing.bookId,
+          bookTitle: borrowing.bookTitle,
+          status: borrowing.status,
+          type: borrowing.type
+        })
+      }
+    }
+
+    return (
+      <Card className="mb-4" onClick={handleCardClick}>
+        <CardContent className="p-6">
+          <div className="flex items-start justify-between">
+            <div className="flex-1">
+              <div className="flex items-center space-x-3 mb-2">
+                {getStatusIcon(borrowing.status)}
+                <h3 className="font-semibold text-lg">{borrowing.bookTitle}</h3>
+              </div>
+
+              <div className="space-y-2 text-sm text-muted-foreground">
+                <p>
+                  <span className="font-medium">Request Date:</span> {formatDate(borrowing.requestDate)}
+                </p>
+
+                {borrowing.dueDate && (
+                  <p>
+                    <span className="font-medium">Due Date:</span> {formatDate(borrowing.dueDate)}
+                    {isOverdue(borrowing.dueDate) && (
+                      <span className="ml-2 text-red-500 font-medium">
+                        <AlertTriangle className="inline h-4 w-4 mr-1" />
+                        Overdue
+                      </span>
+                    )}
+                  </p>
+                )}
+
+                <p>
+                  <span className="font-medium">Type:</span>{" "}
+                  {borrowing.type === "borrow" ? "Borrow Request" : "Return Request"}
+                </p>
+              </div>
             </div>
 
-            <div className="space-y-2 text-sm text-muted-foreground">
-              <p>
-                <span className="font-medium">Request Date:</span> {formatDate(borrowing.requestDate)}
-              </p>
+            <div className="flex flex-col items-end space-y-2">
+              {getStatusBadge(borrowing.status, borrowing.dueDate)}
 
-              {borrowing.dueDate && (
-                <p>
-                  <span className="font-medium">Due Date:</span> {formatDate(borrowing.dueDate)}
-                  {isOverdue(borrowing.dueDate) && (
-                    <span className="ml-2 text-red-500 font-medium">
-                      <AlertTriangle className="inline h-4 w-4 mr-1" />
-                      Overdue
-                    </span>
-                  )}
-                </p>
+              {showReturnButton && borrowing.status === "approved" && !hasPendingReturn(borrowing.id) && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => handleReturnRequest(borrowing)}
+                  disabled={submittingReturn === borrowing.id}
+                >
+                  {submittingReturn === borrowing.id ? "Submitting..." : "Request Return"}
+                </Button>
               )}
 
-              <p>
-                <span className="font-medium">Type:</span>{" "}
-                {borrowing.type === "borrow" ? "Borrow Request" : "Return Request"}
-              </p>
+              {showReturnButton && hasPendingReturn(borrowing.id) && <Badge variant="secondary">Return Pending</Badge>}
             </div>
           </div>
-
-          <div className="flex flex-col items-end space-y-2">
-            {getStatusBadge(borrowing.status, borrowing.dueDate)}
-
-            {showReturnButton && borrowing.status === "approved" && !hasPendingReturn(borrowing.id) && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => handleReturnRequest(borrowing)}
-                disabled={submittingReturn === borrowing.id}
-              >
-                {submittingReturn === borrowing.id ? "Submitting..." : "Request Return"}
-              </Button>
-            )}
-
-            {showReturnButton && hasPendingReturn(borrowing.id) && <Badge variant="secondary">Return Pending</Badge>}
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  )
+        </CardContent>
+      </Card>
+    )
+  }
 
   const EmptyState = ({ title, description, icon: Icon }: { title: string; description: string; icon: any }) => (
     <div className="text-center py-12">
@@ -296,7 +401,7 @@ export default function BorrowingsPage() {
             <p className="text-gray-600">Track your borrowing requests and manage returns</p>
           </div>
 
-          <Tabs defaultValue="pending" className="w-full">
+          <Tabs value={currentTab} onValueChange={handleTabChange} className="w-full">
             <TabsList className="grid w-full grid-cols-3">
               <TabsTrigger value="pending">Pending ({pendingBorrowings.length})</TabsTrigger>
               <TabsTrigger value="approved">Approved ({approvedBorrowings.length})</TabsTrigger>

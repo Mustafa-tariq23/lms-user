@@ -10,6 +10,7 @@ import { collection, query, where, getDocs } from "firebase/firestore"
 import { db } from "@/lib/firebase"
 import { Book, Clock, AlertTriangle, CheckCircle } from "lucide-react"
 import { format, isAfter } from "date-fns"
+import { logger, withErrorLogging } from "@/lib/logger"
 
 interface Borrowing {
   id: string
@@ -30,79 +31,20 @@ export default function DashboardPage() {
     overdueBooks: 0,
   })
 
-  // Add these helper functions at the top of the component
-  const formatDate = (date: any) => {
-    if (!date) return "N/A"
-
-    // Handle Firestore Timestamp
-    if (date.toDate && typeof date.toDate === "function") {
-      return format(date.toDate(), "MMM dd, yyyy")
-    }
-
-    // Handle regular Date object
-    if (date instanceof Date) {
-      return format(date, "MMM dd, yyyy")
-    }
-
-    // Handle date string
-    if (typeof date === "string") {
-      return format(new Date(date), "MMM dd, yyyy")
-    }
-
-    return "N/A"
-  }
-
-  const isOverdue = (dueDate: any) => {
-    if (!dueDate) return false
-
-    let dateToCheck: Date
-
-    // Handle Firestore Timestamp
-    if (dueDate.toDate && typeof dueDate.toDate === "function") {
-      dateToCheck = dueDate.toDate()
-    }
-    // Handle regular Date object
-    else if (dueDate instanceof Date) {
-      dateToCheck = dueDate
-    }
-    // Handle date string
-    else if (typeof dueDate === "string") {
-      dateToCheck = new Date(dueDate)
-    } else {
-      return false
-    }
-
-    return isAfter(new Date(), dateToCheck)
-  }
-
-  // Update the getStatusBadge function
-  const getStatusBadge = (status: string, dueDate?: any) => {
-    if (status === "approved" && isOverdue(dueDate)) {
-      return <Badge variant="destructive">Overdue</Badge>
-    }
-
-    switch (status) {
-      case "pending":
-        return <Badge variant="secondary">Pending</Badge>
-      case "approved":
-        return <Badge variant="default">Approved</Badge>
-      case "returned":
-        return <Badge variant="outline">Returned</Badge>
-      case "rejected":
-        return <Badge variant="destructive">Rejected</Badge>
-      default:
-        return <Badge variant="outline">{status}</Badge>
-    }
-  }
+  const logError = withErrorLogging("DashboardPage")
 
   useEffect(() => {
     if (user) {
       fetchBorrowings()
+      // Log dashboard view
+      logger.logViewHistory("dashboard", user.uid)
     }
   }, [user])
 
   const fetchBorrowings = async () => {
     if (!user) return
+
+    const startTime = Date.now()
 
     try {
       // Simple query without orderBy to avoid composite index requirement
@@ -128,18 +70,43 @@ export default function DashboardPage() {
 
       const pendingRequests = borrowingsData.filter((b) => b.status === "pending")
 
-      // Update the stats calculation in fetchBorrowings
-      const overdueBooks = activeBorrowings.filter((b) => isOverdue(b.dueDate))
+      const overdueBooks = activeBorrowings.filter((b) => b.dueDate && isAfter(new Date(), b.dueDate.toDate()))
 
       setStats({
         activeBorrowings: activeBorrowings.length,
         pendingRequests: pendingRequests.length,
         overdueBooks: overdueBooks.length,
       })
-    } catch (error) {
+
+      // Log successful API request
+      await logger.logApiRequest("/api/borrowings", "GET", Date.now() - startTime, 200, user.uid)
+    } catch (error: any) {
       console.error("Error fetching borrowings:", error)
+      logError(error, user.uid)
+
+      // Log failed API request
+      await logger.logApiRequest("/api/borrowings", "GET", Date.now() - startTime, 500, user.uid)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const getStatusBadge = (status: string, dueDate?: any) => {
+    if (status === "approved" && dueDate && isAfter(new Date(), dueDate.toDate())) {
+      return <Badge variant="destructive">Overdue</Badge>
+    }
+
+    switch (status) {
+      case "pending":
+        return <Badge variant="secondary">Pending</Badge>
+      case "approved":
+        return <Badge variant="default">Approved</Badge>
+      case "returned":
+        return <Badge variant="outline">Returned</Badge>
+      case "rejected":
+        return <Badge variant="destructive">Rejected</Badge>
+      default:
+        return <Badge variant="outline">{status}</Badge>
     }
   }
 
@@ -208,19 +175,24 @@ export default function DashboardPage() {
                 </div>
               ) : (
                 <div className="space-y-4">
-                  {/* Update the borrowing display sections to use formatDate */}
                   {activeBorrowings.map((borrowing) => (
                     <div key={borrowing.id} className="flex items-center justify-between p-4 border rounded-lg">
                       <div className="flex-1">
                         <h3 className="font-medium">{borrowing.bookTitle}</h3>
-                        <p className="text-sm text-muted-foreground">Borrowed on {formatDate(borrowing.requestDate)}</p>
+                        <p className="text-sm text-muted-foreground">
+                          Borrowed on {format(borrowing.requestDate.toDate(), "MMM dd, yyyy")}
+                        </p>
                         {borrowing.dueDate && (
-                          <p className="text-sm text-muted-foreground">Due: {formatDate(borrowing.dueDate)}</p>
+                          <p className="text-sm text-muted-foreground">
+                            Due: {format(borrowing.dueDate.toDate(), "MMM dd, yyyy")}
+                          </p>
                         )}
                       </div>
                       <div className="flex items-center space-x-2">
                         {getStatusBadge(borrowing.status, borrowing.dueDate)}
-                        {isOverdue(borrowing.dueDate) && <AlertTriangle className="h-4 w-4 text-red-500" />}
+                        {borrowing.dueDate && isAfter(new Date(), borrowing.dueDate.toDate()) && (
+                          <AlertTriangle className="h-4 w-4 text-red-500" />
+                        )}
                       </div>
                     </div>
                   ))}
@@ -245,14 +217,13 @@ export default function DashboardPage() {
                 </div>
               ) : (
                 <div className="space-y-4">
-                  {/* Update the recent activity section */}
                   {borrowings.slice(0, 5).map((borrowing) => (
                     <div key={borrowing.id} className="flex items-center justify-between p-4 border rounded-lg">
                       <div className="flex-1">
                         <h3 className="font-medium">{borrowing.bookTitle}</h3>
                         <p className="text-sm text-muted-foreground">
                           {borrowing.type === "borrow" ? "Borrow request" : "Return request"} •{" "}
-                          {formatDate(borrowing.requestDate)}
+                          {format(borrowing.requestDate.toDate(), "MMM dd, yyyy")}
                         </p>
                       </div>
                       {getStatusBadge(borrowing.status, borrowing.dueDate)}

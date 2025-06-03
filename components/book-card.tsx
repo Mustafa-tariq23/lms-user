@@ -8,7 +8,8 @@ import { useToast } from "@/hooks/use-toast"
 import { useAuth } from "@/contexts/auth-context"
 import { collection, addDoc, query, where, getDocs } from "firebase/firestore"
 import { db } from "@/lib/firebase"
-import { Loader2, Book, User, Calendar } from "lucide-react"
+import { Loader2, Book, User, Calendar } from 'lucide-react'
+import { logger, withErrorLogging } from "@/lib/logger"
 
 interface BookCardProps {
   book: {
@@ -30,6 +31,8 @@ export function BookCard({ book }: BookCardProps) {
   const { user, userData } = useAuth()
   const { toast } = useToast()
 
+  const logError = withErrorLogging("BookCard")
+
   const checkExistingRequest = async () => {
     if (!user) return
 
@@ -43,19 +46,34 @@ export function BookCard({ book }: BookCardProps) {
 
       const querySnapshot = await getDocs(q)
       setAlreadyRequested(!querySnapshot.empty)
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error checking existing request:", error)
+      logError(error, user.uid)
     }
   }
 
   useState(() => {
     checkExistingRequest()
+
+    // Log book view when card is rendered
+    if (user) {
+      logger.logBookView(book.id, book.title, user.uid, "browse")
+    }
   })
 
   const handleBorrowRequest = async () => {
     if (!user || !userData) return
 
+    // Log borrow button click
+    logger.logUserInteraction("click", "borrow_button", "books", user.uid, `borrow-btn-${book.id}`, {
+      bookId: book.id,
+      bookTitle: book.title,
+      availableCopies: book.availableCopies
+    })
+
     setLoading(true)
+    const startTime = Date.now()
+
     try {
       // Check again before creating request
       await checkExistingRequest()
@@ -65,6 +83,9 @@ export function BookCard({ book }: BookCardProps) {
           description: "You have already requested this book or it's currently borrowed by you.",
           variant: "destructive",
         })
+
+        // Log failed borrow request
+        await logger.logBorrowRequest(book.id, book.title, "already_requested", user.uid, "Book already requested")
         return
       }
 
@@ -79,12 +100,33 @@ export function BookCard({ book }: BookCardProps) {
       })
 
       setAlreadyRequested(true)
+
+      // Log successful borrow request
+      await logger.logBorrowRequest(book.id, book.title, "submitted", user.uid)
+
+      // Log API request timing
+      await logger.logApiRequest("/api/borrowings", "POST", Date.now() - startTime, 201, user.uid, {
+        bookId: book.id,
+        bookTitle: book.title,
+      })
+
       toast({
         title: "Request Submitted",
         description: "Your borrow request has been submitted successfully.",
       })
     } catch (error: any) {
       console.error("Error submitting borrow request:", error)
+      logError(error, user.uid)
+
+      // Log failed borrow request
+      await logger.logBorrowRequest(book.id, book.title, "failed", user.uid, error.message)
+
+      // Log failed API request
+      await logger.logApiRequest("/api/borrowings", "POST", Date.now() - startTime, 500, user.uid, {
+        bookId: book.id,
+        bookTitle: book.title,
+      })
+
       toast({
         title: "Error",
         description: error.message || "Failed to submit borrow request",
@@ -95,8 +137,19 @@ export function BookCard({ book }: BookCardProps) {
     }
   }
 
+  const handleCardClick = () => {
+    if (user) {
+      logger.logUserInteraction("click", "book_card", "books", user.uid, `book-card-${book.id}`, {
+        bookId: book.id,
+        bookTitle: book.title,
+        author: book.author,
+        genre: book.genre
+      })
+    }
+  }
+
   return (
-    <Card className="h-full flex flex-col">
+    <Card className="h-full flex flex-col" onClick={handleCardClick}>
       <div className="aspect-[3/4] relative overflow-hidden rounded-t-lg">
         <img
           src={book.imageUrl || "/placeholder.svg?height=400&width=300"}

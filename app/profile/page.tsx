@@ -2,7 +2,7 @@
 
 import type React from "react"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { useAuth } from "@/contexts/auth-context"
 import { ProtectedRoute } from "@/components/protected-route"
 import { Navbar } from "@/components/navbar"
@@ -15,12 +15,22 @@ import { doc, updateDoc } from "firebase/firestore"
 import { db } from "@/lib/firebase"
 import { User, Mail, Calendar, BookOpen, Loader2 } from "lucide-react"
 import { format } from "date-fns"
+import { logger, withErrorLogging } from "@/lib/logger"
 
 export default function ProfilePage() {
   const { user, userData } = useAuth()
   const [name, setName] = useState(userData?.name || "")
   const [loading, setLoading] = useState(false)
   const { toast } = useToast()
+
+  const logError = withErrorLogging("ProfilePage")
+
+  useEffect(() => {
+    if (user) {
+      // Log profile view
+      logger.logViewHistory("profile", user.uid)
+    }
+  }, [user])
 
   const handleUpdateProfile = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -36,10 +46,15 @@ export default function ProfilePage() {
     }
 
     setLoading(true)
+    const startTime = Date.now()
+
     try {
       await updateDoc(doc(db, "users", user.uid), {
         name: name.trim(),
       })
+
+      // Log successful profile update
+      await logger.logApiRequest("/api/profile", "PUT", Date.now() - startTime, 200, user.uid, { name: name.trim() })
 
       toast({
         title: "Success",
@@ -47,6 +62,11 @@ export default function ProfilePage() {
       })
     } catch (error: any) {
       console.error("Error updating profile:", error)
+      logError(error, user.uid)
+
+      // Log failed profile update
+      await logger.logApiRequest("/api/profile", "PUT", Date.now() - startTime, 500, user.uid, { name: name.trim() })
+
       toast({
         title: "Error",
         description: error.message || "Failed to update profile",

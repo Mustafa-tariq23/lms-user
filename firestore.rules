@@ -1,0 +1,85 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper function to check if user is admin
+    function isAdmin() {
+      return request.auth != null && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+    
+    // Helper function to check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Users collection rules
+    match /users/{userId} {
+      // Users can read their own document
+      allow read: if isAuthenticated() && request.auth.uid == userId;
+      // Users can update their own document (except role)
+      allow update: if isAuthenticated() && request.auth.uid == userId && 
+        !("role" in request.resource.data.diff(resource.data).affectedKeys());
+      // Admins can read and write all user documents
+      allow read, write: if isAdmin();
+      // Allow user creation during signup
+      allow create: if isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Books collection rules
+    match /books/{bookId} {
+      // All authenticated users can read books
+      allow read: if isAuthenticated();
+      // Only admins can create, update, delete books
+      allow write: if isAdmin();
+    }
+    
+    // Borrowings collection rules
+    match /borrowings/{borrowingId} {
+      // Users can read their own borrowings
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      // Users can create borrowing requests for themselves
+      allow create: if isAuthenticated() && 
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == "pending";
+      // Users can update their own return requests
+      allow update: if isAuthenticated() && 
+        resource.data.userId == request.auth.uid &&
+        request.resource.data.type == "return" &&
+        request.resource.data.status == "pending";
+      // Admins can read and write all borrowings
+      allow read, write: if isAdmin();
+    }
+    
+    // User-specific logs (subcollection under users)
+    match /users/{userId}/logs/{logId} {
+      // Users can create logs for themselves
+      allow create: if isAuthenticated() && request.auth.uid == userId;
+      // Users can read their own logs
+      allow read: if isAuthenticated() && request.auth.uid == userId;
+      // Admins can read all user logs
+      allow read: if isAdmin();
+      // No one can update or delete logs (immutable)
+      allow update, delete: if false;
+    }
+
+    // System logs (simple collection)
+    match /systemLogs/{logId} {
+      // Allow system error logs without authentication, others require auth
+      allow create: if request.resource.data.type == "system_error" || isAuthenticated();
+      // Only admins can read system logs
+      allow read: if isAdmin();
+      // No one can update or delete logs (immutable)
+      allow update, delete: if false;
+    }
+    
+    // Auth logs - special collection with more permissive rules for login/logout events
+    match /authLogs/{logId} {
+      // Allow creation without authentication for login attempts
+      allow create: if true;
+      // Only admins can read auth logs
+      allow read: if isAdmin();
+      // No one can update or delete logs (immutable)
+      allow update, delete: if false;
+    }
+  }
+}
